@@ -1,0 +1,433 @@
+package com.anryg.es.admin;
+
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
+import com.anryg.common.ConfigUtils;
+import org.elasticsearch.action.bulk.BulkRequestBuilder;
+import org.elasticsearch.action.bulk.BulkResponse;
+import org.elasticsearch.action.delete.DeleteResponse;
+import org.elasticsearch.action.index.IndexRequest;
+import org.elasticsearch.action.index.IndexRequestBuilder;
+import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.SearchType;
+import org.elasticsearch.action.support.WriteRequest;
+import org.elasticsearch.client.transport.TransportClient;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.common.transport.TransportAddress;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.index.query.BoolQueryBuilder;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.index.reindex.BulkByScrollResponse;
+import org.elasticsearch.index.reindex.DeleteByQueryAction;
+import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.sort.SortOrder;
+import org.elasticsearch.transport.client.PreBuiltTransportClient;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.*;
+
+import static org.elasticsearch.index.query.QueryBuilders.boolQuery;
+import static org.elasticsearch.index.query.QueryBuilders.rangeQuery;
+
+public class ESClientUtils implements Serializable {
+    private static org.slf4j.Logger logger = LoggerFactory.getLogger(ESClientUtils.class);
+    private static ESClientUtils esClientUtils;
+    private static volatile TransportClient esClusterClient;  /**保证线程间可见*/
+
+    static {
+        try {
+            System.setProperty("es.set.netty.runtime.available.processors", "false");
+            esClusterClient = initClient();
+        } catch (Exception e) {
+            logger.error("ESClient创建失败..." + esClusterClient, e);
+        }
+    }
+
+    private ESClientUtils() {
+    }
+
+    /**
+     * @DESC: 初始化ES客户端
+     */
+    private static TransportClient initClient() throws UnknownHostException {
+        String key = ConfigUtils.getSingleConf("es/es.cluster.name");
+        String key1 = ConfigUtils.getESConf().get("es.cluster.nodes");
+        Settings settings = Settings.builder().put("cluster.name", key).put("client.transport.sniff", true)
+                /*.put("xpack.security.transport.ssl.enabled", false).put("xpack.security.user", "elastic:elastic")*//**添加xpack模块设置*/  //.put("index.translog.interval",key2)
+                .build();
+        return new PreBuiltTransportClient(settings).addTransportAddresses(assembleESAddress().toArray(new TransportAddress[assembleESAddress().size()]));
+    }
+    /*public static ESClientUtils getInstance(){
+        if (esClientUtils == null) {
+            synchronized (ESClientUtils.class) {
+                if (esClientUtils == null) {
+                    esClientUtils = new ESClientUtils();
+                }
+            }
+        }
+        return esClientUtils;
+    }*/
+
+    /**
+     * @desc: 获取TransportClient，懒汉模式
+     */
+    public static TransportClient getClient() {
+        if (null == esClusterClient) {
+            synchronized (ESClientUtils.class) {
+                if (null == esClusterClient) {
+                    try {
+                        esClusterClient = initClient();
+                        //esClusterClient.settings();
+                    } catch (Exception e) {
+                        logger.error("ESClient创建失败...." + esClusterClient, e);
+                    }
+                }
+            }
+        }
+        return esClusterClient;
+    }
+
+    /**
+     * @DESC: 关闭client连接
+     */
+    public static void closeClient() {
+        if (esClusterClient != null) {
+            synchronized (ESClientUtils.class) {
+                try {
+                    esClusterClient.close();
+                    logger.info("ES Client 关闭成功...");
+                } catch (Exception e) {
+                    logger.error("ES Client关闭失败...", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * @Desc: 利用bulk API将消息批量写入ES,不考虑routing
+     */
+    public static boolean save2ES(TransportClient client, String index, String type, Collection<Map<String, Object>> messages, boolean ifSetId) throws Exception {
+        boolean succeed = true;
+        double begin = System.currentTimeMillis();
+        try {
+            BulkRequestBuilder bulkRequestBuilder = client.prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
+            for (Map<String, Object> message : messages) {
+                IndexRequestBuilder indexRequestBuilder1 = null;
+                if (ifSetId)
+                    indexRequestBuilder1 = client.prepareIndex().setId(message.get("id").toString()).setOpType(IndexRequest.OpType.INDEX).setIndex(index).setType("doc");
+                else {
+                    indexRequestBuilder1 = client.prepareIndex()
+                            .setOpType(IndexRequest.OpType.INDEX) //如果该doc不存在则insert，存在则update
+                            .setIndex(index).setType("doc");
+                }
+                //message.remove("id");
+                //message.remove("protocoltype");
+                IndexRequestBuilder indexRequestBuilder2 = indexRequestBuilder1.setSource(message);
+                bulkRequestBuilder.add(indexRequestBuilder2);
+            }
+//            logger.info("开始通过单线程模式加载数据到ES.....");
+            BulkResponse bulkResponse = bulkRequestBuilder.execute().actionGet();
+            if (bulkResponse.hasFailures()) {
+                succeed = false;
+                logger.error("写入ES失败：" + bulkResponse.buildFailureMessage());
+                throw new Exception("写入ES失败" + bulkResponse.buildFailureMessage());
+            }
+        } catch (Exception e) {
+            logger.error("ES 写入ES失败...", e);
+            throw new Exception("写入ES失败", e);
+        } finally {
+            //ESClientUtils.closeClient()不需要关闭，关闭有时候反而会中断ES的连接;
+        }
+        double end = System.currentTimeMillis();
+        return succeed;
+//        logger.info("The total load time cost " + (end - begin)/1000 + " S...");//打印写入到ES所花的总时间
+    }
+
+    /**
+     * @DESC: 利用bulk API将消息批量写入ES,考虑routing
+     */
+    public static void save2ESWithRouting(TransportClient client, String index, String type, String routing, List<Map<String, Object>> messages, boolean ifSetId) {
+        double begin = System.currentTimeMillis();
+        if (null == client) client = ESClientUtils.getClient();//有可能第一次初始的client为null，需要重新
+        try {
+            BulkRequestBuilder bulkRequestBuilder = client.prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
+            for (Map<String, Object> message : messages) {
+                IndexRequestBuilder indexRequestBuilder1 = null;
+                if (ifSetId)
+                    indexRequestBuilder1 = client.prepareIndex().setId(message.get("id").toString()).setRouting(routing).setOpType(IndexRequest.OpType.INDEX).setIndex(index).setType("doc");
+                else {
+                    indexRequestBuilder1 = client.prepareIndex()
+                            .setOpType(IndexRequest.OpType.INDEX) //如果该doc不存在则insert，存在则update
+                            .setRouting(routing)
+                            .setIndex(index).setType("doc");
+                }
+                IndexRequestBuilder indexRequestBuilder2 = indexRequestBuilder1.setSource(message);
+                bulkRequestBuilder.add(indexRequestBuilder2);
+            }
+            logger.info("开始通过bulk模式加载数据到ES.....");
+            BulkResponse bulkResponse = bulkRequestBuilder.execute().actionGet();
+            if (bulkResponse.hasFailures()) {
+                logger.error("写入ES失败：" + messages + bulkResponse.buildFailureMessage());
+            }
+        } finally {
+        }
+        double end = System.currentTimeMillis();
+        logger.info("The total load time cost " + (end - begin) / 1000 + " S...");//打印写入到ES所花的总时间
+    }
+
+    /**
+     * @Desc: 利用bulk API将消息批量写入ES的索引信息表
+     */
+    public static void saveES4IndexInfo(TransportClient client, String index, List<Map<String, String>> messages) {
+        double begin = System.currentTimeMillis();
+        try {
+            BulkRequestBuilder bulkRequestBuilder = client.prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
+            for (Map<String, String> message : messages) {
+                IndexRequestBuilder indexRequestBuilder1 = client.prepareIndex()
+                        .setId(message.get("id").toString())
+                        .setOpType(IndexRequest.OpType.INDEX) //如果该doc不存在则insert，存在则update
+                        .setIndex(index).setType("doc");
+                message.remove("id");
+                //message.remove("protocoltype");
+                IndexRequestBuilder indexRequestBuilder2 = indexRequestBuilder1.setSource(message);
+                bulkRequestBuilder.add(indexRequestBuilder2);
+            }
+            logger.info("开始通过单线程模式加载数据到ES.....");
+            BulkResponse bulkResponse = bulkRequestBuilder.execute().actionGet();
+            if (bulkResponse.hasFailures()) {
+                logger.error("写入ES失败：" + bulkResponse.buildFailureMessage());
+            }
+        } finally {
+            //ESClientUtils.closeClient();
+        }
+        double end = System.currentTimeMillis();
+        logger.info("The total load time cost " + (end - begin) / 1000 + " S...");//打印写入到ES所花的总时间
+    }
+
+    /**
+     * @Desc : 根据index从已经完成的index中获取最大时间和最小时间
+     */
+    public static String getTimeRangeByIndex(TransportClient client, String index, String sortField) {
+        String fromTime = "";
+        String endTime = "";
+        try {
+            SearchResponse ascResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                    .setQuery(QueryBuilders.matchAllQuery())
+                    .setSize(1).setScroll(TimeValue.timeValueMinutes(8))
+                    .addSort(sortField, SortOrder.ASC)
+                    .execute().actionGet();
+            SearchResponse descResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                    .setQuery(QueryBuilders.matchAllQuery())
+                    .setSize(1).setScroll(TimeValue.timeValueMinutes(8))
+                    .addSort(sortField, SortOrder.DESC)
+                    .execute().actionGet();
+            SearchHit[] ascHits = ascResponse.getHits().getHits();
+            SearchHit[] descHits = descResponse.getHits().getHits();
+            for (SearchHit hit : ascHits) {
+                fromTime = hit.getSourceAsMap().get(sortField).toString();
+            }
+            for (SearchHit hit : descHits) {
+                endTime = hit.getSourceAsMap().get(sortField).toString();
+            }
+        } catch (Exception e) {
+            logger.error("从当前索引中获取时间范围失败...", e);
+        } finally {
+            //ESClientUtils.closeClient();
+        }
+        return fromTime + "-" + endTime;
+    }
+
+    /**
+     * @DESC: 从index_info中获取当前正在进行索引的others协议的索引别名，用来对拼接数据入ES
+     */
+    public static String getRunningOthersAlias(TransportClient client) {
+        try {
+            SearchResponse searchResponse = client.prepareSearch("index_info").setSearchType(SearchType.DEFAULT)
+                    .setQuery(QueryBuilders.matchAllQuery())
+                    .setSize(1000).setScroll(TimeValue.timeValueMinutes(8))
+                    .execute().actionGet();
+            ArrayList<String> aliasList = new ArrayList<>();
+            SearchHit[] resultHits = searchResponse.getHits().getHits();
+            for (SearchHit hit : resultHits) {
+
+                if (hit.getType().startsWith("others_") && hit.getType().endsWith("9999999999999"))
+                    aliasList.add(hit.getType());
+            }
+            if (aliasList.size() > 1) {
+                long maxNum = 0L;
+                for (String alias : aliasList) {
+                    long eachNum = Long.parseLong(alias.split("_")[1].split("-")[0]);
+                    if (maxNum < eachNum) maxNum = eachNum;
+                }
+                return "others_" + maxNum + "-9999999999999";
+            } else return aliasList.get(0);
+        } finally {
+            //ESClientUtils.closeClient();
+        }
+    }
+
+    /**
+     * @DESC: 通过index以及某个field来判断该doc是否存在
+     */
+    public static int ifFieldExist(TransportClient client, String index, String field, String fieldValue) {
+        int length = 0;
+        try {
+            SearchResponse searchResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                    //.setQuery(QueryBuilders.termQuery("_id", id))
+                    .setQuery(QueryBuilders.termQuery(field, fieldValue))
+                    .execute().actionGet();
+            length = searchResponse.getHits().getHits().length;
+        } catch (Exception e) {
+            logger.error("查找字段是否存在报错..." + field, e);
+        } finally {
+            //ESClientUtils.closeClient();
+        }
+        /*if (length > 0) return true;
+        else return false;*/
+        return length;
+    }
+
+    /***根据条件进行删除*/
+    public static void deleteByQuery(TransportClient client, String index, String filedName, String time) {
+        try {
+            BulkByScrollResponse deleteResponse =
+                    DeleteByQueryAction.INSTANCE.newRequestBuilder(client)
+                            .filter(boolQuery().must(rangeQuery(filedName).lte(time)))
+                            .source(index)
+                            .get();
+            long deleted = deleteResponse.getDeleted();
+            if (deleted > 0) {
+                logger.info("删除记录成功...");
+            } else {
+                logger.info("没有数据被删除...");
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            logger.error("删除索引 " + index + "数据失败,删除时间小于" + time);
+        }
+    }
+
+    /**
+     * @DESC: 通过需要查询的field获取对应ES中查询到的记录，当前方法只适合查询结果只有一条记录的情况
+     */
+    public static Map<String, Object> getFieldValue(TransportClient client, String index, String field, String fieldValue/*,String field*/) {
+        //String result = "";
+        Map<String, Object> result = new HashMap<>();
+        SearchResponse searchResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                //.setQuery(QueryBuilders.termQuery("_id", id))
+                .setQuery(QueryBuilders.termQuery(field, fieldValue))
+                .execute().actionGet();
+        SearchHit[] resultHits = searchResponse.getHits().getHits();
+        for (SearchHit hit : resultHits) {
+            result.putAll(hit.getSourceAsMap())/*.get(field).toString()*/;
+        }
+        return result;
+    }
+
+    /**
+     *
+     */
+    public static List<Map<String, Object>> getRecordsByField(TransportClient client, String index, String field, String fieldValue, String sortField) {
+        ArrayList<Map<String, Object>> recordsList = new ArrayList<>();
+        SearchResponse searchResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                .setQuery(QueryBuilders.termQuery(field, fieldValue))
+                .addSort(sortField, SortOrder.DESC).setSize(1)
+                .execute().actionGet();
+        SearchHit[] resultHits = searchResponse.getHits().getHits();
+        for (SearchHit hit : resultHits) {
+            recordsList.add(hit.getSourceAsMap());
+        }
+        return recordsList;
+    }
+
+    /**
+     * @DESC: 通过id获取ES对应的doc内容
+     */
+    public static Map<String, Object> getRecordById(TransportClient client, String index, String id) {
+        Map<String, Object> rst = null;
+        SearchResponse searchResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT)
+                .setQuery(QueryBuilders.termQuery("_id", id))
+                .execute().actionGet();
+        SearchHit[] resultHits = searchResponse.getHits().getHits();
+        for (SearchHit hit : resultHits) {
+            rst = hit.getSourceAsMap();
+        }
+        return rst;
+    }
+
+    /**
+     * @DESC: 利用scroll的方式将查询的所有结果都取出来
+     */
+    public static Map<String, Set<Object>> getAllResultByFields(TransportClient client, String index, List<String> fields, int pageSize) {
+        Map<String, Set<Object>> allResultMap = new HashMap<>();
+        /*QueryBuilder query = QueryBuilders.matchPhraseQuery("id","1505716911872129657");*/
+        BoolQueryBuilder boolQuestBuilder = boolQuery()
+                .must(QueryBuilders.matchAllQuery());
+        //.must(QueryBuilders.wildcardQuery("files", "*")); //用这种方式来匹配files不能为空值的情况
+        SearchResponse scrollResponse = client.prepareSearch(index)
+                .setSearchType(SearchType.DEFAULT)
+                /*.setVersion(true)*/
+                .setQuery(boolQuestBuilder)
+                //.setExplain(true)
+                //.setHighlighterRequireFieldMatch(false)
+                .setSize(pageSize).setScroll(TimeValue.timeValueMinutes(1))
+                .execute().actionGet();
+        int sum = scrollResponse.getHits().getHits().length;
+        logger.info("====" + sum);
+        SearchHit[] hits = scrollResponse.getHits().getHits();
+        for (SearchHit hit : hits) {
+            JSONObject hitJson = JSON.parseObject(hit.getSourceAsString());
+            /*for (String field:fields) {
+                String value = hitJson.getString(field);
+                HashSet<Object> valueSet = new HashSet<>();
+                valueSet.add(value);
+                if (allResultMap.containsKey(field)){
+                    Set<Object> previousValueSet = allResultMap.get(field);
+                    previousValueSet.addAll(valueSet);
+                    allResultMap.put(field,previousValueSet);
+                }
+                else allResultMap.put(field,valueSet);
+            }*/
+            //logger.info(hit.getId());
+            //logger.info("The first is: " + hit.getSourceAsString());
+        }
+        Long count = scrollResponse.getHits().getTotalHits();//第一次不返回数据
+        logger.info("=====" + count);
+        while (sum < count) {
+            scrollResponse = client.prepareSearchScroll(scrollResponse.getScrollId())
+                    .setScroll(TimeValue.timeValueMinutes(8))
+                    .execute().actionGet();
+            sum += scrollResponse.getHits().getHits().length;
+            logger.info("查询总量为：" + count + " ," + "已经查询到：" + sum);
+            //logger.info("ID: " + scrollResponse.getScrollId());
+        }
+        return allResultMap;
+    }
+
+    /**
+     * @DESC: 删除某条ES记录
+     */
+    public static boolean deleteDoc(String index, String type, String id) {
+        //logger.warn("开始删除doc..." + id);
+        DeleteResponse deleteResponse = ESClientUtils.getClient().prepareDelete(index, "doc", id).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
+                .execute().actionGet();
+        if (deleteResponse.status().getStatus() > 0) return true;
+        else return false;
+    }
+
+    /**
+     * @DESC: 组装ES的hosts为TransportAddress
+     */
+    private static List<TransportAddress> assembleESAddress() throws UnknownHostException {
+        ArrayList<TransportAddress> esAddrList = new ArrayList<>();
+        String[] esAddrArray = ConfigUtils.getESConf().get("es.cluster.nodes").split(",");
+        for (String es : esAddrArray)
+            esAddrList.add(new TransportAddress(InetAddress.getByName(es), Integer.valueOf(ConfigUtils.getSingleConf("es/es.cluster.tcp.port"))));
+        return esAddrList;
+    }
+
+}
