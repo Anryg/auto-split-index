@@ -1,0 +1,39 @@
+
+package com.anryg.common
+
+import org.apache.spark.SparkContext
+import org.apache.spark.streaming.{Seconds, StreamingContext}
+
+//Spark context帮助类
+object SparkContextFactory {
+
+  def newSparkStreamingContext(appName:String = "sparkStreaming" , batchInterval:Long = 30L) : StreamingContext = {
+    
+    val sparkConf = SparkConfFactory.newSparkStreamingConf(appName)
+    new StreamingContext(sparkConf, Seconds(batchInterval))
+  }
+
+  def newSparkLocalStreamingContext(appName:String = "sparkStreaming" , batchInterval:Long = 30L , threads : Int = 2) : StreamingContext = {
+
+    val sparkConf = SparkConfFactory.newSparkLoalConf(appName, threads)
+    new StreamingContext(sparkConf, Seconds(batchInterval))
+  }
+  
+   def newSparkLocalBatchContext(appName:String = "sparkLocalBatch" , threads : Int = 2) : SparkContext = {
+
+    val sparkConf = SparkConfFactory.newSparkLoalConf(appName, threads)
+    new SparkContext(sparkConf)
+  }
+
+  def newSparkBatchContext(appName:String = "sparkBatch") : SparkContext = {
+    val sparkConf = SparkConfFactory.newSparkBatchConf(appName)
+    new SparkContext(sparkConf)
+  }
+  
+  def startSparkStreaming(ssc:StreamingContext){
+     ssc.start()
+	 ssc.awaitTermination()
+	 ssc.stop()
+  }
+
+}
