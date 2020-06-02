@@ -1,0 +1,138 @@
+package com.anryg.common;
+
+import com.ecwid.consul.v1.ConsulClient;
+import com.ecwid.consul.v1.Response;
+import com.ecwid.consul.v1.kv.model.GetValue;
+import org.apache.log4j.Logger;
+
+import java.io.*;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Created by Anryg on 2017/8/2.
+ */
+public class ConfigUtils implements Serializable {
+    private static final Logger logger = Logger.getLogger(ConfigUtils.class);
+    private static ConsulClient client = new ConsulClient(readConsulIP());
+
+    private static HashMap<String, String> confMap = new HashMap<>(10,1);/**存放配置信息的KV对*/
+
+    /**
+     * @DESC: consul的ip从配置文件读取
+     * */
+    private static String readConsulIP(){
+        String ip = "";
+        InputStream in = ConfigUtils.class.getClassLoader().getResourceAsStream("consul");
+        InputStreamReader isr = new InputStreamReader(in);
+        BufferedReader br = new BufferedReader(isr);
+        try {
+            ip = br.readLine().trim();/**只读取第一行*/
+        } catch (IOException e) {
+            logger.error("读取consul文件的地址报错...",e);
+        }
+        return ip;
+    }
+
+    /**
+    * @desc get the whole hadoop core util map
+    * */
+    public static Map<String,String> getHadoopConf(){
+        try {
+            return getConf("hadoop/");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：hadoop/", e);
+            return null;
+        }
+    }
+
+    /**
+    * @desc get the es conf
+    * */
+    public static Map<String,String> getESConf(){
+        try {
+            return getConf("es/es");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：es/es", e);
+            return null;
+        }
+    }
+
+    /**
+     * @desc get the kafka conf
+     * */
+    public static Map<String,String> getKafkaConf(){
+        try {
+            return getConf("kafka/");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：kafka/",e);
+            return null;
+        }
+    }
+
+    /**
+     * @DESC: 获取spark streaming配置
+    * */
+    public static Map<String,String> getSparkStreamingConf(){
+        try {
+            return getConf("spark/spark-streaming-config/");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：spark/spark-streaming-config",e);
+            return null;
+        }
+    }
+
+    /**
+     * @DESC: 获取spark batch配置
+    * */
+    public static Map<String,String> getSparkBatchConf(){
+        try {
+            return getConf("spark/spark-batch-config/");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：spark/spark-batch-config",e);
+            return null;
+        }
+    }
+
+    /**
+     * @DESC: 获取spark任务的列表
+     * */
+    public static Map<String,String> getAllJobs(){
+        try {
+            return getConf("spark/task-monitor");
+        } catch (Exception e) {
+            logger.error("请检查Consul配置：spark/task-monitor",e);
+            return null;
+        }
+    }
+
+    /**
+     * @DESC: 获取某个单独配置
+     * */
+    public static String getSingleConf(String conPath){
+        try {
+            return client.getKVValue(conPath).getValue().getDecodedValue();
+        } catch (Exception e) {
+            logger.error("请检查Consul配置："+ conPath,e);
+            return null;
+        }
+    }
+
+    private static Map<String,String> getConf(String confPath){
+        if ( ! confMap.isEmpty()){
+            confMap.clear();
+        }
+        //HashMap<String, String> confMap = new HashMap<>();
+        Response<List<GetValue>> response = client.getKVValues(confPath);
+        List<GetValue> kvList = response.getValue();
+        for (GetValue kv:kvList){
+            String[] keySplit = kv.getKey().split("/");
+            String value = kv.getDecodedValue();
+            confMap.put(keySplit[keySplit.length - 1],value);
+        }
+        confMap.remove(confPath.split("/")[confPath.split("/").length - 1]);
+        return confMap;
+    }
+
+}
