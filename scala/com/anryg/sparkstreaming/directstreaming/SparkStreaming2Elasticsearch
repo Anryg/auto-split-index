@@ -1,0 +1,84 @@
+package com.anryg.sparkstreaming.directstreaming
+
+import java.util
+
+import com.zrt.common.items.IMSI
+import com.zrt.common.SparkContextFactory
+import org.apache.spark.rdd.RDD
+
+/**
+  * @DESC: 将kafka上的数据用spark streaming进行消费入ES,并根据数据量来判断是否需要分索引
+  * @Author: Anryg
+  * @Date: 2019/8/28 9:20
+  **/
+object ImsiData2ESStreaming extends StreamingHelper {
+  setConsumer("MyConsumer")
+
+  /**
+    * @param: args(0) test-topic kafka的topic
+    * @param: args(1) test_index/mapping  索引名/mapping对象
+    * @param: args(2) 批次的时间，单位为秒
+    **/
+  def main(args: Array[String]): Unit = {
+    val indexAndType = args(1)
+
+    /** test_index/mapping */
+    CURRENT_INDEX = indexAndType.split("/")(0)
+    val ssc = SparkContextFactory.newSparkStreamingContext("kafka-spark-es", java.lang.Long.valueOf(args(2)))
+    val inputDStream = initDStream(args(0).split(","), ssc)
+    inputDStream.foreachRDD(rawRDD => {
+      if (rawRDD.partitions.size > 0) {
+        val rdd = rawRDD.map(consumerRecord => (consumerRecord.key(), consumerRecord.value())).cache() ##提取RDD信息
+        /** *********/
+        if (rawRDD.id == 0) RDD_ID = rawRDD.id
+        initAlias()  //初始化别名
+        /** ********/
+        /** 提取kafka中的有效信息 */
+        val rdd1 = rdd.map(kv => kv._2.asInstanceOf[String])
+        if (!rdd1.isEmpty()) {
+          var success = true
+          try {
+            //rdd1.foreach(println(_))
+            val rdd2 = processRDD(rdd1)
+            writeAndJudgeSplitIndex(rdd2, indexAndType)
+          } catch {
+            case e: Exception => {
+              success = false
+              logger.error("数据处理失败...", e)
+            }
+          }
+          if (success) {
+            logger.info("本批次的RDD写入ES " + CURRENT_INDEX + "成功，修改zk的offset...")
+
+            /** 修改，保存offset */
+            updateOffset(rawRDD, inputDStream)  //将本次消费成功的RDD中数据的offset进行提交，避免任务重启后的重复消费
+          }
+        }
+      }
+    })
+    ssc.start()
+    ssc.awaitTermination()
+  }
+
+  /**
+    * @DESC: 具体业务处理部分,根据不同数据处理需求进行调整
+    **/
+  private def processRDD(rdd: RDD[String]): RDD[util.Map[String, Any]] = {
+    rdd.map(str => {
+      val recordMap = new util.HashMap[String, Any]()
+      val strSplits = str.split(",")
+      val c1 = strSplits(0)
+      val c2 = strSplits(1)
+      val c3 = strSplits(2)
+      val c4 = if (null != strSplits(3) || "".equals(strSplits(3))) strSplits(3) else 0
+      recordMap.put("c1" c1)
+      recordMap.put("c2", c2)
+      recordMap.put("c3", c3)
+      recordMap.put("c4", c4)
+      val id = c1   //定义ES的_id
+      recordMap.put("id", id)
+      recordMap
+    })
+
+  }
+}
