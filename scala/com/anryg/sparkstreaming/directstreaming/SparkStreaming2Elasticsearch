@@ -1,9 +1,7 @@
 package com.anryg.sparkstreaming.directstreaming
 
 import java.util
-
-import com.zrt.common.items.IMSI
-import com.zrt.common.SparkContextFactory
+import com.anryg.common.SparkContextFactory
 import org.apache.spark.rdd.RDD
 
 /**
