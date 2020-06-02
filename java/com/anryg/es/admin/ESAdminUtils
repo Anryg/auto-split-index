@@ -1,0 +1,314 @@
+package com.anryg.es.admin;
+
+
+import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
+import com.anryg.common.ConfigUtils;
+import com.anryg.es.mapping.MappingUtils;
+import org.apache.log4j.Logger;
+import org.elasticsearch.action.admin.cluster.state.ClusterStateResponse;
+import org.elasticsearch.action.admin.indices.alias.exists.AliasesExistResponse;
+import org.elasticsearch.action.admin.indices.alias.get.GetAliasesRequest;
+import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
+import org.elasticsearch.action.admin.indices.exists.indices.IndicesExistsResponse;
+import org.elasticsearch.action.admin.indices.get.GetIndexResponse;
+import org.elasticsearch.action.admin.indices.stats.IndicesStatsResponse;
+import org.elasticsearch.action.support.master.AcknowledgedResponse;
+import org.elasticsearch.client.transport.TransportClient;
+import org.elasticsearch.cluster.metadata.AliasMetaData;
+import org.elasticsearch.cluster.metadata.AliasOrIndex;
+import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.metadata.MetaData;
+import org.elasticsearch.common.collect.ImmutableOpenMap;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.query.QueryBuilders;
+import org.elasticsearch.index.reindex.BulkByScrollResponse;
+import org.elasticsearch.index.reindex.DeleteByQueryAction;
+import java.io.Serializable;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+/**
+ * Created by Anryg on 2017/7/7.
+ */
+public class ESAdminUtils implements Serializable {
+
+    private static Logger LOG = Logger.getLogger(ESAdminUtils.class);
+    private static int PRIMARY_SHARD = Integer.valueOf(ConfigUtils.getSingleConf("es/es.primary.shard"));
+    private static int REP_SHARD = Integer.valueOf(ConfigUtils.getSingleConf("es/es.replicate.shard"));
+    /*分索引的临界值*/
+    private static long SIZE_LIMIT = Long.valueOf(ConfigUtils.getSingleConf("es/es.index.size"));
+    private static final long SEARCH_TIME_OUT = 30000L;
+    private  static int scrollSize=1000;
+    ThreadLocal<Integer> x= new ThreadLocal<Integer>();
+    /**
+     * 創建索引
+     *
+     * @param client
+     * @param index
+     * @param shard
+     * @param replication
+     * @return
+     */
+    public static boolean createIndices(TransportClient client, String index, int shard, int replication) {
+        if (!indexExists(client, index)) {
+            LOG.info("该index不存在，创建...");
+            CreateIndexResponse createIndexResponse = null;
+            try {
+                createIndexResponse = client.admin().indices().prepareCreate(index)
+                    .setSettings(Settings.builder()
+                        .put("index.number_of_shards", shard)
+                        .put("index.number_of_replicas", replication)
+                        //20171221添加,因为ES在5.x之后只能在index级别进行该项配置,且这几项配置与2.x比没有改变
+                        .put("index.translog.sync_interval", "100s")
+                        .put("index.translog.durability", "async")
+                        /////////////////////////////////
+                        .put("index.codec", "best_compression")
+                        .put("index.max_result_window", 50000000)//20180313添加，修改查询时候单页最大能够返回的记录数，默认为10000
+                        //.put("index.analysis.analyzer.default.type", "ik_max_word")//添加默认分词器设置
+                        .put("index.mapping.total_fields.limit", 100)/**单个index允许的最大field个数，默认1000*/
+                        //.put("index.routing.allocation.include.zone","hot,stale")/**最初索引数据允许存放的zone空间*/
+                        //.put("index.routing.allocation.total_shards_per_node",1)/**每个节点允许的分片数量*/
+                        //.put("index.translog.flush_threshold_size","1024mb")
+                        //.put("index.mapping.single_type","false") //可以多个type在同一个index里面,只适用于5.x, 6.x之后的版本只允许一个type
+                        .put("refresh_interval", "100s"))
+                    .execute().actionGet(SEARCH_TIME_OUT);
+                boolean success = createIndexResponse.isAcknowledged();
+                if (success) {
+                    LOG.info("索引" + index + "创建成功.....");
+                    return success;
+                } else return false;
+            } catch (Exception e) {
+                LOG.error(null, e);
+                return false;
+            }
+        }
+        LOG.warn("该index " + index + " 已经存在...");
+        return true;
+    }
+
+    /**
+     * @desc 为index增加别名，如果该index原来有别名则先删除再增加..
+     */
+    public static boolean deleteThenAddAlias(TransportClient client, String[] indexs, String alias) {
+        for (String index : indexs) deleteAliasPerIndex(client, index);
+        boolean success = false;
+        AliasesExistResponse aliasExistResponse = client.admin().indices().prepareAliasesExist(alias).execute().actionGet(SEARCH_TIME_OUT);
+        if (!aliasExistResponse.isExists()) {
+            try {
+                AcknowledgedResponse aliasResponse = client.admin().indices().prepareAliases().addAlias(indexs, alias).execute().actionGet(SEARCH_TIME_OUT);
+                success = aliasResponse.isAcknowledged();
+            } catch (Exception e) {
+                e.printStackTrace();
+                LOG.error("创建别名" + alias + "失败.....");
+            }
+        } else {
+            LOG.warn("该别名" + alias + "已经存在...");
+            success = true;
+            return success;
+        }
+        if (success) {
+            LOG.info("别名" + alias + "创建成功...");
+        }
+        return success;
+    }
+
+    /**
+     * @desc 判断需要创建的index是否存在
+     */
+    public static boolean indexExists(TransportClient client, String index) {
+        boolean ifExists = false;
+        try {
+            IndicesExistsResponse existsResponse = client.admin().indices().prepareExists(index).execute().actionGet(SEARCH_TIME_OUT);
+            ifExists = existsResponse.isExists();
+        } catch (Exception e) {
+            LOG.error("判断index是否存在失败......", e);
+            return ifExists;
+        }
+        return ifExists;
+    }
+
+    /**
+     * @desc 获取index所有主分片的的大小，GB
+     */
+    public static double getIndexSize(TransportClient client, String index) {
+        double sizeInBytes = 0;
+        try {
+            IndicesStatsResponse indexStateResponse = client.admin().indices().prepareStats(index).execute().actionGet(SEARCH_TIME_OUT);
+            sizeInBytes = indexStateResponse.getPrimaries().getStore().getSizeInBytes();
+        } catch (Exception e) {
+            e.printStackTrace();
+            LOG.error("Index大小获取失败......");
+            return 0;
+        }
+        return sizeInBytes / 1024 / 1024 / 1024;
+    }
+
+    /**
+     * @desc 获取index所有主分片的文档数
+     */
+    public static long getIndexDocCount(TransportClient client, String index) {
+        long docsCount = 0;
+        try {
+            IndicesStatsResponse indexStateResponse = client.admin().indices().prepareStats(index).execute().actionGet(SEARCH_TIME_OUT);
+            docsCount = indexStateResponse.getPrimaries().getDocs().getCount();
+        } catch (Exception e) {
+            LOG.error("Index文档数获取失败......" + index,e);
+            return 0;
+        }
+        return docsCount;
+    }
+
+    /**
+     * @desc 获取当前ES集群的index列表，只获取处于OPEN状态的index
+     */
+    public static String[] getOpenIndexs(TransportClient client) {
+        ArrayList<String> indexArray = new ArrayList<>();
+        try {
+            ClusterStateResponse stateResponse = client.admin().cluster().prepareState().execute().actionGet(SEARCH_TIME_OUT);
+            //UnmodifiableIterator<String> keyIters = stateResponse.getState().getMetaData().indices().keysIt();
+            Iterator<ObjectObjectCursor<String, IndexMetaData>> stateIters = stateResponse.getState().getMetaData().indices().iterator();
+            while (stateIters.hasNext()) {
+                ObjectObjectCursor<String, IndexMetaData> next = stateIters.next();
+                if ("OPEN".equalsIgnoreCase(next.value.getState().toString())) {
+                    indexArray.add(next.key);
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            LOG.error("获取ES索引列表失败.....");
+        }
+        String[] indices = null;
+        if (indexArray.size() > 0) {
+            indices = new String[indexArray.size()];
+            for (int i = 0; i < indexArray.size(); i++) {
+                indices[i] = indexArray.get(i);
+            }
+        }
+        return indices;
+    }
+
+    /**
+     * @Desc: 根据时间范围提取符合条件的index的别名
+     */
+    public static Set<String> getEligibleIndexs(TransportClient client, String fromTime, String endTime) {
+        ArrayList<String> alias = new ArrayList<>();
+        HashSet<String> eligibleIndexs = new HashSet<>();
+        //String fromTime = date2TimeStamp(fromDate);
+        //String endTime = date2TimeStamp(endDate);
+        try {
+            SortedMap<String, AliasOrIndex> aliasMap = client.admin().cluster().prepareState().execute().actionGet(SEARCH_TIME_OUT).getState().getMetaData().getAliasAndIndexLookup();
+            Iterator<Map.Entry<String, AliasOrIndex>> aliasIters = aliasMap.entrySet().iterator();
+
+            while (aliasIters.hasNext()) {
+                Map.Entry<String, AliasOrIndex> next = aliasIters.next();
+                if (next.getValue().isAlias()) {
+                    if (next.getKey().split("_").length == 2) alias.add(next.getKey());
+                }
+            }
+            for (String alia : alias) {
+                if( alia.split("_").length<2||alia.split("_")[1].split("-").length<2){//
+                    continue;
+                }
+                String ft = alia.split("_")[1].split("-")[0];
+                String et = alia.split("_")[1].split("-")[1];
+                if (Long.parseLong(fromTime) <= Long.parseLong(ft) && Long.parseLong(endTime) >= Long.parseLong(et))
+                    eligibleIndexs.add(alia);
+                if (Long.parseLong(fromTime) <= Long.parseLong(ft) && Long.parseLong(endTime) >= Long.parseLong(ft))
+                    eligibleIndexs.add(alia);
+                if (Long.parseLong(fromTime) <= Long.parseLong(et) && Long.parseLong(endTime) >= Long.parseLong(et))
+                    eligibleIndexs.add(alia);
+                if (Long.parseLong(fromTime) >= Long.parseLong(ft) && Long.parseLong(endTime) <= Long.parseLong(et))
+                    eligibleIndexs.add(alia);
+            }
+        } catch (Exception e) {
+            LOG.error("获取符合条件的index别名失败....", e);
+        }
+        return eligibleIndexs;
+    }
+
+    /**
+     * @Desc: 获取某个index的别名列表
+     */
+    public static List<String> getAliasPerIndex(TransportClient client, String index) {
+        ArrayList<String> aliasList = new ArrayList<>();
+        try {
+            Iterator<ObjectObjectCursor<String, List<AliasMetaData>>> aliasAndIndexIter = client.admin().indices().getAliases(new GetAliasesRequest()).actionGet(SEARCH_TIME_OUT).getAliases().iterator();
+            while (aliasAndIndexIter.hasNext()) {
+                ObjectObjectCursor<String, List<AliasMetaData>> next = aliasAndIndexIter.next();
+                String key = next.key;//key为index名称
+                if (index.equals(key)) {
+                    List<AliasMetaData> aliasMetaList = next.value;
+                    for (AliasMetaData alias : aliasMetaList) aliasList.add(alias.alias());
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("获取" + index + "别名失败...", e);
+        }
+        return aliasList;
+    }
+
+    /**
+     * */
+    private static boolean deleteAliasPerIndex(TransportClient client, String index) {
+        List<String> aliasList = getAliasPerIndex(client, index);
+        boolean success = false;
+        if (aliasList.size() > 0) {
+            try {
+                for (String alias : aliasList) {
+                    AcknowledgedResponse removeAlaisResponse = client.admin().indices().prepareAliases().removeAlias(index, alias).execute().actionGet(SEARCH_TIME_OUT);
+                    success = removeAlaisResponse.isAcknowledged();
+                }
+            } catch (Exception e) {
+                LOG.error("删除别名失败...", e);
+            }
+        }
+        return success;
+    }
+
+    /**
+     * @desc 删除目前所有存在的alias
+     */
+    public static void deleteAllAlias(TransportClient client) {
+        ArrayList<String> alias = new ArrayList<>();
+        try {
+            SortedMap<String, AliasOrIndex> aliasMap = client.admin().cluster().prepareState().execute().actionGet(SEARCH_TIME_OUT).getState().getMetaData().getAliasAndIndexLookup();
+            Iterator<Map.Entry<String, AliasOrIndex>> aliasIters = aliasMap.entrySet().iterator();
+            while (aliasIters.hasNext()) {
+                Map.Entry<String, AliasOrIndex> next = aliasIters.next();
+                if (next.getValue().isAlias()) {
+                    alias.add(next.getKey());
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("删除alias之前，获取alias失败....", e);
+        }
+        if (alias.size() > 0) {
+            for (String alia : alias) {
+                try {
+                    client.admin().indices().prepareAliases().removeAlias(getOpenIndexs(client), alia).execute().actionGet(SEARCH_TIME_OUT).isAcknowledged();
+                } catch (Exception e) {
+                    LOG.error("删除alias失败....", e);
+                }
+            }
+        }
+    }
+
+    /**
+     * @param date
+     * @return
+     * @desc 将一般日期格式转换成为Unix时间戳 如：2017-07-14 15:37:21 转换成为：1500316415394
+     */
+    private static String date2TimeStamp(String date) {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+        String timeStamp = "";
+        try {
+            timeStamp = String.valueOf(sdf.parse(date).getTime());
+        } catch (ParseException e) {
+            e.printStackTrace();
+            //logger.error("Unix timestamp transfer failed...");
+        }
+        return timeStamp;
+    }
+
+}
