@@ -1,0 +1,291 @@
+package com.anryg.sparkstreaming.directstreaming
+
+import java.util
+
+import com.anryg.common.items.IMSI
+import com.anryg.common.{CommonUtils, ConfigUtils, FILETYPE, FileCommon, HDFSUtils}
+import com.anryg.es.admin.{ESAdminUtils, ESClientUtils}
+import com.anryg.es.mapping.MappingUtils
+import org.apache.kafka.clients.consumer.{ConsumerRecord, OffsetAndMetadata, OffsetCommitCallback}
+import org.apache.kafka.common.TopicPartition
+import org.apache.spark.rdd.RDD
+import org.apache.spark.streaming.StreamingContext
+import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.kafka010.{CanCommitOffsets, ConsumerStrategies, HasOffsetRanges, KafkaUtils, LocationStrategies}
+import org.elasticsearch.action.search.SearchType
+import org.elasticsearch.action.support.WriteRequest.RefreshPolicy
+import org.elasticsearch.client.transport.TransportClient
+import org.elasticsearch.index.query.QueryBuilders
+
+import scala.collection.JavaConversions._
+import org.elasticsearch.spark.rdd.EsSpark
+import org.slf4j.LoggerFactory
+
+
+/**
+  * Created by Anryg on 2017/8/22.
+  * spark streaming写入ES的帮助类
+  */
+trait StreamingHelper {
+	val logger = LoggerFactory.getLogger(this.getClass)
+	/*分索引的临界值*/
+	val SIZE_LIMIT = ConfigUtils.getSingleConf("es/es.index.size").toLong
+	/*ES主分片的个数*/
+	val ES_SHARDS = ConfigUtils.getSingleConf("es/es.primary.shard").toInt
+	/*ES分片冗余因子*/
+	val ES_REP = ConfigUtils.getSingleConf("es/es.replicate.shard").toInt
+	var CURRENT_INDEX = ""
+	val ES_CLIENT = ESClientUtils.getClient
+	val GROUP_ID = "Consumer001"
+	/*将丢失的RDD中的offset信息存储到HDFS特定文件*/
+	val LOST_OFFSET_PREFIX_PATH = "/tmp/lost_data/kafka2es/missed_rdd_offset."
+	/*将每个批次的索引中的起始时间和末尾时间保存到HDFS特定文件*/
+	val START_END_OFFSET_PREFIX_PATH = "/tmp/start_end_offsets/offsets."
+	var RDD_ID = -1
+	val BEGIN_OFFSET_MAP = new util.HashMap[Int,Long]()
+	/*每次分完索引时候第一次生成的别名*/
+	var ALIAS_FIRST = ""
+	/**kafka参数*/
+	val kafkaParams = new util.HashMap[String,Object]()
+	kafkaParams.put("bootstrap.servers",ConfigUtils.getKafkaConf.get("metadata.broker.list"))
+	kafkaParams.put("key.deserializer","org.apache.kafka.common.serialization.StringDeserializer")
+	kafkaParams.put("value.deserializer","org.apache.kafka.common.serialization.StringDeserializer") /**默认的反序列化方式,可根据需要进行修改*/
+	kafkaParams.put("group.id",GROUP_ID)
+	kafkaParams.put("auto.offset.reset","latest")
+	kafkaParams.put("enable.auto.commit",false: java.lang.Boolean)
+
+	/**
+	  * @DESC: 可根据需要修改读取kafka的value的反序列化方式
+	  * */
+	def setDeserializer(className:String): Unit ={
+		kafkaParams.replace("value.deserializer",className)
+	}
+
+	/**
+	  * @DESC: 可根据需要修改consumer的group id
+	  * */
+	def setConsumer(consumer:String): Unit ={
+		kafkaParams.replace("group.id",consumer)
+	}
+
+	/**
+	  * @DESC: 初始化DStream
+	  * */
+	def initDStream(topics:Array[String],ssc:StreamingContext) = KafkaUtils.createDirectStream[String,Any](ssc,LocationStrategies.PreferConsistent,ConsumerStrategies.Subscribe[String,Any](topics,kafkaParams))
+
+	/**
+	  * @DESC; 保存offset，用kafka自带的topic进行保存
+	  * */
+	def updateOffset(rawRDD:RDD[ConsumerRecord[String,Any]],inputDStream: InputDStream[ConsumerRecord[String,Any]]): Unit ={
+		val offsetRange = rawRDD.asInstanceOf[HasOffsetRanges].offsetRanges
+		for (offset <- offsetRange) {
+			val partition = offset.partition; val fromOffset = offset.fromOffset; val untilOffset = offset.untilOffset
+			logger.info("打印分区消费的情况：" + partition + ":" + fromOffset + "-" + untilOffset)
+		}
+		inputDStream.asInstanceOf[CanCommitOffsets].commitAsync(offsetRange,new OffsetCommitCallback() {
+			override def onComplete(offsets: util.Map[TopicPartition, OffsetAndMetadata], exception: Exception): Unit ={
+				if (null != exception) logger.error("提交offset出现问题...",exception)
+			}
+		})
+	}
+
+	/**
+	  * DESC: 对于一个索引的第一批数据进行别名的获取
+	  * */
+	def initAlias(): Unit ={
+		if (RDD_ID == 0) {/**判断是否第一批数据*/
+			RDD_ID = -1
+			/////////////////给正在写入的索引取别名
+			val aliasList = ESAdminUtils.getAliasPerIndex(ESClientUtils.getClient,CURRENT_INDEX)
+			if ("".equals(ALIAS_FIRST) && aliasList.size() == 0) {
+				ALIAS_FIRST = addAlias4FirstRunningIndex(CURRENT_INDEX) /**任务最初运行的第一个索引的别名*/
+				/////////////////将别名的起始时间保存到ES的index_info中
+				saveIndexTimeRange(ALIAS_FIRST,ALIAS_FIRST,CURRENT_INDEX)
+				////////////////
+			}
+			if (!"".equals(ALIAS_FIRST) && aliasList.size() == 0) {
+				addAlias4RunningIndex(CURRENT_INDEX,ALIAS_FIRST) /**任务运行一段时间经过了分索引，新索引的别名*/
+				/////////////////将别名的起始时间保存到ES的index_info中
+				saveIndexTimeRange(ALIAS_FIRST,ALIAS_FIRST,CURRENT_INDEX)
+				////////////////
+			}
+			if (aliasList.size() > 0) {
+				val alias = aliasList.get(0)
+				ALIAS_FIRST = alias
+			}
+		}
+	}
+
+	/**
+	  * DESC: 给开始RDD ID为0的时候的index根据时间取别名
+	  * @return : 如果添加别名成功则返回添加的别名，如果没有添加成功则返回空字符串
+	  * */
+	def addAlias4FirstRunningIndex(index:String): String ={
+		val alias = index.split("_")(1) + "_" + System.currentTimeMillis().toString + "-" + "9999999999999"
+		val success = ESAdminUtils.deleteThenAddAlias(ESClientUtils.getClient,index.split(","),alias)
+		if (success) alias else ""
+	}
+
+	/**
+	  * DESC: 对于基础协议，将当前分完索引或者正在插入数据的索引的起始时间记录下来，以别名形式将结果保存到index_info中
+	  * @param alias 需要解析的别名，将别名中的起始时间和结束时间取出来存到index_info中
+	  * */
+	def saveIndexTimeRange(firstAlias:String, alias:String,index:String): Unit ={
+		val targetIndex = "index_info"
+		//val fromEndTime:util.Map[java.lang.String,java.lang.Long] = new util.HashMap[java.lang.String,java.lang.Long]()
+		val fromEndTime:util.Map[String,String] = new util.HashMap[String,String]()
+		val _type = alias.split("_")(0)
+		val fromTime = alias.split("_")(1).split("-")(0)
+		fromEndTime.put("from_time",fromTime)
+		val endTime = alias.split("_")(1).split("-")(1)
+		fromEndTime.put("end_time",endTime)
+		fromEndTime.put("id",alias)
+		fromEndTime.put("alias_name",alias)
+		fromEndTime.put("type",_type)
+		fromEndTime.put("index",index)
+		val fromEndTimeList:java.util.List[java.util.Map[String,String]] = new java.util.ArrayList[java.util.Map[String,String]]()
+		fromEndTimeList.add(fromEndTime)
+		//ESClientUtils.getInstance().getClient.prepareDelete(targetIndex,firstAlias,firstAlias.split("_")(1).split("-")(0)).execute().actionGet()//先删除最初建立的别名的那条记录
+		logger.info("删除index_info中之前存在的别名..." + firstAlias)
+		ESClientUtils.getClient.prepareDelete(targetIndex,"doc",firstAlias).setRefreshPolicy(RefreshPolicy.IMMEDIATE).get()
+		ESClientUtils.saveES4IndexInfo(ESClientUtils.getClient,targetIndex,fromEndTimeList)
+	}
+
+	/**
+	  * DESC: 给RDD ID不为0，分完新的索引且还在插入数据的index
+	  * */
+	def addAlias4RunningIndex(index:String,alias:String): String ={
+		val success = ESAdminUtils.deleteThenAddAlias(ESClientUtils.getClient,index.split(","),alias)
+		if (success) alias else ""
+	}
+
+	
+	/**
+	  * @DESC: 根据当前索引的数据量来判断现在是否需要分索引
+	  * @param rdd: 经过数据处理完成的rdd
+	  *  */
+	def writeAndJudgeSplitIndex(rdd:RDD[util.Map[String,Any]],indexAndType:String): Unit ={
+		/*判断即将写入的index大小是否超过限制*/
+		val docsCount = ESAdminUtils.getIndexDocCount(ES_CLIENT, CURRENT_INDEX)
+		//val size = ESAdminUtils.getIndexSize(ES_CLIENT,CURRENT_INDEX)
+		logger.info("当前doc量为: " + docsCount.toString)
+		if (docsCount <= SIZE_LIMIT) {
+			/*doc数量小于SIZE_LIMIT,则写入ES*/
+			write2ES(rdd,true)
+		}
+		else {
+			//////////////////保存每次分索引时候最后一个RDD的起始offset
+			RDD_ID = 0
+			/////////////////给完成的索引取别名
+			val alias = addAlias4FinishedIndex(CURRENT_INDEX)
+			/////////////////将别名的起始时间保持到ES的index_info中
+			saveIndexTimeRange(ALIAS_FIRST,alias,CURRENT_INDEX)
+			ALIAS_FIRST = CURRENT_INDEX.split("_")(1) + "_" + alias.split("_")(1).split("-")(1) + "-" + "9999999999999"
+			////////////////
+			/*doc数量大于SIZE_LIMIT,则新建索引*/
+			val currentTimeStamp = System.currentTimeMillis()
+			val previousIndex = indexAndType.split("/")(0)
+			val newIndex = previousIndex.split("_")(0) + "_" + previousIndex.split("_")(1) + "_" + CommonUtils.timeStamp2Date(currentTimeStamp)
+			val success = ESAdminUtils.createIndices(ES_CLIENT, newIndex, ES_SHARDS, ES_REP)
+			if (success) {
+				addMappings(newIndex, indexAndType)
+				CURRENT_INDEX = newIndex
+				write2ES(rdd,true)
+			}
+		}
+	}
+
+	/**
+	  * DESC: 针对基础协议的入库数据，向已经完成的索引添加别名，该别名以实际index排序过的真实时间为准进行命名
+	  * */
+	def addAlias4FinishedIndex(index:String): String ={
+		val alias = index.split("_")(1) + "_" + ESClientUtils.getTimeRangeByIndex(ESClientUtils.getClient,index,IMSI.CAPTURE_TIME)
+		val success = ESAdminUtils.deleteThenAddAlias(ESClientUtils.getClient,index.split(","),alias)
+		if (success) alias else ""
+	}
+
+	/**
+	  * @DESC:
+	  * @param indexAndTypes
+	  * */
+	def addMappings(index:String, indexAndTypes:String): Unit ={
+		val typee = indexAndTypes.split("/").last
+		MappingUtils.addMapping(index,typee,"es6.1.0/mapping/" + typee)
+	}
+
+
+	/**
+	  * DESC: 将丢失的offset信息写入HDFS
+	  * */
+	def saveOffsetInfo(rdd:RDD[(String,String)], indexAndType:String): Unit ={
+		logger.warn("本批次的RDD数据已经丢失")
+		try {
+			val offsetRangeArray = rdd.asInstanceOf[HasOffsetRanges].offsetRanges
+			for (offsetRange <- offsetRangeArray) {
+				logger.warn("丢失的RDD offset信息为: " + offsetRange)
+				logger.info("保存丢失的RDD的offset...")
+				val message = "topic: " + offsetRange.topic + "," + "partition: " + offsetRange.partition + "," + "fromoffset: " +
+				  offsetRange.fromOffset + "," + "endoffset:" + offsetRange.untilOffset + "," + "index:" + CURRENT_INDEX
+				HDFSUtils.save2HDFS(LOST_OFFSET_PREFIX_PATH + {if (indexAndType.split("/").last.split(",").length > 1) "others" else indexAndType.split("/").last}, "\n" + message)
+			}
+		} catch {
+			case e:Exception => logger.error("保存丢失的offset信息失败...",e)
+		}
+	}
+	/**
+	  * DESC: 将处理好的RDD数据存入ES
+	  * @param withID: 是否需要根据id存，为了达到更高数据写入效率，可以不根据id写入
+	  * */
+	def write2ES(rdd:RDD[java.util.Map[String, Any]], withID:Boolean):Unit ={
+		//val route = CommonUtils.timeStamp2Date(System.currentTimeMillis()).substring(0,8)//以入库时候系统天为单位做数据路由
+		try {
+			if (withID) EsSpark.saveToEs(rdd, CURRENT_INDEX + "/doc", Map(("es.mapping.id", "id")/*, ("es.mapping.exclude", "route"),("es.mapping.routing","<" + route + ">")*/))
+			else EsSpark.saveToEs(rdd, CURRENT_INDEX + "/doc")
+		} catch {
+			case e: Exception => {
+				logger.error("本批次的RDD写入ES失败...",e)
+			}
+		}
+	}
+	/**
+		* 通过id获取ES对应的doc内容
+		* */
+	def  getRecordById( client:TransportClient,  index:String,  id:String):util.Map[String,AnyRef]={
+		val  searchResponse = client.prepareSearch(index).setSearchType(SearchType.DEFAULT).setQuery(QueryBuilders.termQuery("_id", id)).execute.actionGet
+		val  resultHits = searchResponse.getHits.getHits
+		resultHits.nonEmpty
+		resultHits(0).getSourceAsMap
+	}
+	/**
+	  * DESC: 将处理好的RDD数据存入ES，以数据的实际时间且粒度以天为单位进行routing
+	  * */
+	def writ2ESWithRouting(rdd:RDD[java.util.Map[String, Any]], currentIndex:String, indexAndType:String): Unit ={
+		//val client = ESClientUtils.getClient 这个对象(非一般对象，其中里面可能有很多子对象没有进行序列化)不能在这里指定（driver变量），会抛出无法序列化的异常，只能在以executor为单位的环境中（不需要再进行序列化）初始化
+		rdd.map(map =>{
+			val date = map.get(IMSI.CAPTURE_TIME).toString.substring(0, 8)
+			(date,map)//生成routing需要用到的key
+		}).foreachPartition(iter => {
+			val esClient = ESClientUtils.getClient
+			val recordsPerDate = new util.HashMap[String, util.List[util.Map[String,Any]]]()
+			while (iter.hasNext) {
+				val kv = iter.next()
+				val date = kv._1; val record = kv._2
+				if (recordsPerDate.containsKey(date)) {
+					val previousRecords = recordsPerDate.get(date)/**取出之前存在的记录*/
+					previousRecords.add(record) /**添加新的记录*/
+					recordsPerDate.put(date,previousRecords) /**再次写进*/
+				}
+				else {
+					val recordsList = new util.ArrayList[util.Map[String,Any]]()
+					recordsList.add(record)
+					recordsPerDate.put(date,recordsList)
+				}
+			}
+			if (recordsPerDate.size() > 0) {
+				val dateSet = recordsPerDate.keySet()
+				logger.info("开始写入ES...")
+				for (date <- dateSet) ESClientUtils.save2ESWithRouting(esClient, currentIndex,"doc", date, recordsPerDate.get(date).asInstanceOf[util.List[util.Map[String, AnyRef]]], true)
+			}
+		})
+	}
+}
